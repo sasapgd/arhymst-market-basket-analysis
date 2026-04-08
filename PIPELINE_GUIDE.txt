@@ -1,0 +1,46 @@
+MAIN PIPELINE
+1. Run apriori.R
+   Output: Rules_For_Python.csv
+   Note: Apriori was tested for maxlen values 3 to 7.
+
+2. Run rule_reduction_conf.py
+   Output: Rules_For_Python_REDUCED.csv
+   Purpose: confidence-based rule reduction for the main paper pipeline.
+
+3. Run post_reduction_network_analysis.py
+   Input: Rules_For_Python_REDUCED.csv
+   Outputs: MST and filtered-graph CSV/PNG files.
+
+MAIN FILES USED IN THE PAPER
+- apriori.R
+- rule_reduction_conf.py
+- post_reduction_network_analysis.py
+- graph_utils.py
+- mst_network_analysis.py
+- filtered_graph.py
+
+EXPERIMENTAL / AUXILIARY FILES
+- rule_reduction.py
+  Multi-metric version of rule reduction. It can run confidence, lift, or product reduction by changing REDUCTION_METRIC.
+  It was used for the comparison experiment that helped decide that confidence is the best reduction criterion.
+
+- mst_comparison_analysis.py
+  Auxiliary script for comparing MST structures across reduction variants.
+
+- top_rule.py
+  Helper script for exporting top-ranked reduced rules.
+
+OUTPUT NAMING CONVENTION
+- The main pipeline expects the confidence-only reduction step to produce:
+  Rules_For_Python_REDUCED.csv
+
+- The multi-metric experimental script produces:
+  Rules_For_Python_REDUCED_CONFIDENCE.csv
+  Rules_For_Python_REDUCED_LIFT.csv
+  Rules_For_Python_REDUCED_PRODUCT.csv
+
+RECOMMENDED RUN ORDER FOR THE PAPER
+apriori.R -> rule_reduction_conf.py -> post_reduction_network_analysis.py
+
+TEST DATA NOTE
+The package includes a reduced sample dataset for testing the execution pipeline. It is intended only for technical validation of the workflow, so the resulting rule counts, network structure, and quantitative outputs will not match those reported in the paper, which were obtained on the full dataset.
