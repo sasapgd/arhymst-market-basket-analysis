@@ -1,0 +1,51 @@
+# Python and IDE files
+.venv/
+__pycache__/
+*.py[cod]
+.idea/
+
+# The repository includes the anonymized sample in Data/.
+# Local full datasets and archived working material remain excluded.
+Data_anonymized/
+REST/
+
+# Generated experiment directories
+timing_runs/
+sensitivity_experiments/
+support_confidence_experiments/
+segmented_experiments/
+segmented_experiments_new/
+statistical_validation/
+statistical_validation_new/
+valle_mst_comparison/
+valle_mst_comparison_new/
+generated_supplementary_tables/
+S Table/
+
+# Local provenance material not included in the public repository
+legacy_scripts/
+
+# Generated root-level analysis outputs
+Rules_For_Python*.csv
+PRODUCT_GRAPH*.csv
+MST*.csv
+MST*.png
+Filtered_Graph*.csv
+Filtered_Graph*.png
+*_TIMING_SUMMARY.csv
+*_RUN_METADATA.csv
+ALL_PRODUCTS*.csv
+ITEM_FREQUENCY*.csv
+PRODUCTS_IN_RULES*.csv
+EXCLUDED_ROWS_SUMMARY*.csv
+ANONYMIZED_DATA_SUMMARY.csv
+ORIGINAL_*.csv
+NETWORK_MST_TIMING_BY_MAXLEN.csv
+*_BY_MAXLEN.csv
+top*.csv
+top*.png
+PIPELINE_GUIDE.txt
+
+# OS files
+.DS_Store
+Thumbs.db

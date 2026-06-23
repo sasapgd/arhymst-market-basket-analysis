@@ -1,244 +1,175 @@
+"""Compare MaxST edge sets and reproduce Supplementary Table S2."""
+
+from __future__ import annotations
+
+import argparse
+from copy import copy
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import networkx as nx
 import pandas as pd
+from openpyxl.utils import get_column_letter
 
-
-# ============================================================
-# MST COMPARISON ANALYSIS -> Compare Reduction Variants
-# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
-# ==============================
-# SETTINGS
-# ==============================
-
-VARIANT = "COMMON"  # Change to CONF / LIFT / PRODUCT / COMMON.
-
-file_conf = BASE_DIR / "Rules_For_Python_REDUCED_CONFIDENCE.csv"
-file_lift = BASE_DIR / "Rules_For_Python_REDUCED_LIFT.csv"
-file_prod = BASE_DIR / "Rules_For_Python_REDUCED_PRODUCT.csv"
-
-
-# ==============================
-# LOAD FILES
-# ==============================
-
-df_conf = pd.read_csv(file_conf, sep=";")
-df_lift = pd.read_csv(file_lift, sep=";")
-df_prod = pd.read_csv(file_prod, sep=";")
-
-
-# ==============================
-# RULE KEY
-# ==============================
-
-def create_rule_key(df):
-    return df["Premises"].str.strip() + " -> " + df["Conclusion"].str.strip()
-
-
-df_conf["RuleKey"] = create_rule_key(df_conf)
-df_lift["RuleKey"] = create_rule_key(df_lift)
-df_prod["RuleKey"] = create_rule_key(df_prod)
-
-
-# ==============================
-# COMMON-RULE INTERSECTION
-# ==============================
-
-common_rules = set(df_conf["RuleKey"]) \
-    & set(df_lift["RuleKey"]) \
-    & set(df_prod["RuleKey"])
-
-df_common = df_conf[df_conf["RuleKey"].isin(common_rules)].copy()
-
-print(f"Common rules: {len(df_common)}")
-
-
-# ==============================
-# SELECT DATASET
-# ==============================
-
-variant_key = VARIANT.strip().upper()
-variant_frames = {
-    "CONF": df_conf,
-    "CONFIDENCE": df_conf,
-    "LIFT": df_lift,
-    "PRODUCT": df_prod,
-    "COMMON": df_common,
+CRITERIA = ("confidence", "lift", "product")
+LABELS = {
+    "confidence": "Confidence",
+    "lift": "Lift",
+    "product": "Lift × Confidence",
 }
+COMPARISONS = (("confidence", "lift"), ("confidence", "product"), ("lift", "product"))
+REQUIRED_COLUMNS = ("Product_1", "Product_2")
 
-if variant_key not in variant_frames:
-    raise ValueError(
-        f"Unsupported VARIANT '{VARIANT}'. Use CONF, LIFT, PRODUCT, or COMMON."
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare MaxST variants and generate Supplementary Table S2."
     )
-
-selected_df = variant_frames[variant_key]
-
-
-# ==============================
-# GRAPH
-# ==============================
-
-def split_items(x):
-    return [i.strip() for i in str(x).split(",") if i.strip()]
-
-
-G = nx.Graph()
-
-for _, row in selected_df.iterrows():
-    premises = split_items(row["Premises"])
-    conclusions = split_items(row["Conclusion"])
-
-    weight = float(row["Lift"]) * float(row["Confidence"])
-
-    for p in premises:
-        for c in conclusions:
-            if p == c:
-                continue
-
-            if G.has_edge(p, c):
-                if G[p][c]["weight"] < weight:
-                    G[p][c]["weight"] = weight
-            else:
-                G.add_edge(p, c, weight=weight)
+    parser.add_argument("--maxlen", nargs="+", type=int, default=[3, 4, 5, 6])
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=BASE_DIR / "timing_runs" / "mst_variants",
+        help="Directory containing MST_MAXLEN_<N>_<CRITERION>.csv files.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=BASE_DIR / "timing_runs" / "mst_variants",
+        help="Directory for S2 CSV and XLSX outputs.",
+    )
+    return parser.parse_args()
 
 
-# ==============================
-# MST
-# ==============================
-
-mst = nx.maximum_spanning_tree(G, weight="weight")
-
-print(f"MST nodes: {mst.number_of_nodes()}")
-print(f"MST edges: {mst.number_of_edges()}")
+def canonical_edge(product_1: object, product_2: object) -> tuple[str, str]:
+    endpoints = sorted((str(product_1).strip(), str(product_2).strip()))
+    if not all(endpoints) or endpoints[0] == endpoints[1]:
+        raise ValueError(f"Invalid MaxST edge: {product_1!r}, {product_2!r}")
+    return endpoints[0], endpoints[1]
 
 
-# ==============================
-# BFS HORIZONTAL LAYOUT
-# ==============================
-
-def bfs_layout_horizontal(tree):
-    root = max(tree.degree, key=lambda x: x[1])[0]
-
-    pos = {}
-    levels = {}
-    visited = set([root])
-    queue = [(root, 0)]
-
-    while queue:
-        node, level = queue.pop(0)
-        levels.setdefault(level, []).append(node)
-
-        for neighbor in tree.neighbors(node):
-            if neighbor not in visited:
-                visited.add(neighbor)
-                queue.append((neighbor, level + 1))
-
-    for level, nodes in levels.items():
-        height = len(nodes)
-        for i, node in enumerate(nodes):
-            x = level * 2
-            y = -(i - height / 2)
-            pos[node] = (x, y)
-
-    return pos
+def load_edges(path: Path) -> set[tuple[str, str]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"MaxST file not found: {path}")
+    frame = pd.read_csv(path, sep=";")
+    missing = [column for column in REQUIRED_COLUMNS if column not in frame]
+    if missing:
+        raise ValueError(f"{path} is missing columns: {', '.join(missing)}")
+    edges = {
+        canonical_edge(row.Product_1, row.Product_2)
+        for row in frame.itertuples(index=False)
+    }
+    if len(edges) != len(frame):
+        raise ValueError(f"{path} contains duplicate undirected edges.")
+    return edges
 
 
-pos = bfs_layout_horizontal(mst)
+def _write_csv(frame: pd.DataFrame, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    frame.to_csv(temporary, sep=";", index=False)
+    temporary.replace(path)
 
 
-# ==============================
-# NODE RANKING
-# ==============================
-
-degree = dict(mst.degree())
-sorted_nodes = sorted(degree.items(), key=lambda x: x[1], reverse=True)
-
-top5 = [n for n, _ in sorted_nodes[:5]]
-next5 = [n for n, _ in sorted_nodes[5:10]]
-
-
-# ==============================
-# NODE COLORS
-# ==============================
-
-node_colors = []
-node_sizes = []
-
-for node in mst.nodes():
-    if node in top5:
-        node_colors.append("red")
-        node_sizes.append(1200)
-    elif node in next5:
-        node_colors.append("orange")
-        node_sizes.append(800)
-    else:
-        node_colors.append("lightblue")
-        node_sizes.append(400)
+def _format_sheet(writer: pd.ExcelWriter, sheet_name: str, title: str) -> None:
+    worksheet = writer.book[sheet_name]
+    worksheet.insert_rows(1)
+    worksheet.cell(1, 1, title)
+    worksheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=worksheet.max_column)
+    worksheet.freeze_panes = "A3"
+    worksheet.auto_filter.ref = f"A2:{worksheet.cell(worksheet.max_row, worksheet.max_column).coordinate}"
+    for cell in worksheet[1]:
+        font = copy(cell.font)
+        font.bold = True
+        cell.font = font
+    for cell in worksheet[2]:
+        font = copy(cell.font)
+        font.bold = True
+        cell.font = font
+    for column_index in range(1, worksheet.max_column + 1):
+        width = min(
+            max(
+                len(str(worksheet.cell(row_index, column_index).value or ""))
+                for row_index in range(1, worksheet.max_row + 1)
+            )
+            + 2,
+            60,
+        )
+        worksheet.column_dimensions[get_column_letter(column_index)].width = width
 
 
-# ==============================
-# EDGE WIDTHS
-# ==============================
+def main() -> None:
+    args = parse_args()
+    input_dir = args.input_dir.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-weights = [mst[u][v]["weight"] for u, v in mst.edges()]
-max_w = max(weights)
+    summary_rows: list[dict[str, object]] = []
+    detail_rows: list[dict[str, object]] = []
 
-edge_widths = [1 + (w / max_w) * 3 for w in weights]
+    for maxlen in args.maxlen:
+        trees = {
+            criterion: load_edges(
+                input_dir / f"MST_MAXLEN_{maxlen}_{criterion.upper()}.csv"
+            )
+            for criterion in CRITERIA
+        }
+        edge_counts = {len(edges) for edges in trees.values()}
+        if len(edge_counts) != 1:
+            raise ValueError(f"MaxST variants for maxlen={maxlen} have unequal edge counts.")
+
+        for first, second in COMPARISONS:
+            first_only = sorted(trees[first] - trees[second])
+            second_only = sorted(trees[second] - trees[first])
+            common = trees[first] & trees[second]
+            if len(first_only) != len(second_only):
+                raise ValueError(
+                    f"Unequal substitutions for maxlen={maxlen}, {first} vs {second}."
+                )
+
+            comparison = f"{LABELS[first]} vs {LABELS[second]}"
+            summary_rows.append(
+                {
+                    "maxlen": maxlen,
+                    "Comparison": comparison,
+                    "Common edges": len(common),
+                    "Edge substitutions": len(first_only),
+                }
+            )
+            for criterion, edges in ((first, first_only), (second, second_only)):
+                for product_1, product_2 in edges:
+                    detail_rows.append(
+                        {
+                            "maxlen": maxlen,
+                            "Comparison": comparison,
+                            "Present only in": LABELS[criterion],
+                            "Product 1": product_1,
+                            "Product 2": product_2,
+                        }
+                    )
+
+    summary = pd.DataFrame(summary_rows)
+    details = pd.DataFrame(detail_rows)
+    _write_csv(summary, output_dir / "S2_SUMMARY.csv")
+    _write_csv(details, output_dir / "S2_DIFFERING_EDGES.csv")
+
+    workbook_path = output_dir / "S2_Table_generated.xlsx"
+    with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        details.to_excel(writer, sheet_name="Differing_edges", index=False)
+        _format_sheet(
+            writer,
+            "Summary",
+            "S2 Table. Differing MaxST edges across reduction criteria and maximum rule-length settings.",
+        )
+        _format_sheet(
+            writer,
+            "Differing_edges",
+            "S2 Table. Detailed list of differing MaxST edges.",
+        )
+
+    print(summary.to_string(index=False))
+    print(f"Generated workbook: {workbook_path}")
 
 
-# ==============================
-# DRAW
-# ==============================
-
-plt.figure(figsize=(16, 10))
-
-nx.draw_networkx_nodes(mst, pos, node_color=node_colors, node_size=node_sizes)
-nx.draw_networkx_edges(mst, pos, width=edge_widths, alpha=0.7)
-nx.draw_networkx_labels(mst, pos, font_size=8)
-
-plt.title(f"MST ({VARIANT}) - BFS Layout", fontsize=14)
-plt.axis("off")
-
-plt.tight_layout()
-plt.show()
-
-
-# ==============================
-# EXPORT CSV
-# ==============================
-
-# EDGES
-edges_data = []
-
-for u, v, data in mst.edges(data=True):
-    edges_data.append({
-        "Source": u,
-        "Target": v,
-        "Weight": data["weight"],
-    })
-
-df_edges = pd.DataFrame(edges_data)
-edges_file = BASE_DIR / f"MST_{VARIANT}_EDGES.csv"
-df_edges.to_csv(edges_file, index=False)
-
-print(f"Saved edges: {edges_file}")
-
-
-# NODES
-nodes_data = []
-
-for node, deg in mst.degree():
-    nodes_data.append({
-        "Node": node,
-        "Degree": deg
-    })
-
-df_nodes = pd.DataFrame(nodes_data)
-nodes_file = BASE_DIR / f"MST_{VARIANT}_NODES.csv"
-df_nodes.to_csv(nodes_file, index=False)
-
-print(f"Saved nodes: {nodes_file}")
+if __name__ == "__main__":
+    main()

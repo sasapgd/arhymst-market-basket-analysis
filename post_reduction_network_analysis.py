@@ -1,291 +1,370 @@
-# ============================================================
-# POST-REDUCTION NETWORK ANALYSIS -> Export and Visualize Graphs
-# ============================================================
+"""Create manuscript-ready network figures from existing graph and MaxST CSVs.
 
+This stage performs visualization and MaxST centrality analysis only. Graph
+projection, MaxST extraction, and edge filtering remain separate reproducible
+steps and are not silently repeated here.
+"""
+
+from __future__ import annotations
+
+import argparse
 import math
 from pathlib import Path
+from time import perf_counter
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
+import pandas as pd
 
-from filtered_graph import (
-    build_filtered_graph_from_graph,
-    export_filtered_graph,
-    get_isolated_nodes,
-)
+from filtered_graph import format_percent_label, normalize_percentages
 from graph_utils import (
     BASE_DIR,
-    DEFAULT_REDUCED_RULES_FILE,
-    build_full_graph_from_rules,
+    DEFAULT_PRODUCT_GRAPH_FILE,
     get_short_name,
+    load_projected_graph,
 )
-from mst_network_analysis import build_mst_from_graph, export_mst
 
 
-# ==============================
-# SETTINGS
-# ==============================
-
-INPUT_FILE = DEFAULT_REDUCED_RULES_FILE
-MST_OUTPUT_CSV = BASE_DIR / "MST.csv"
-MST_OUTPUT_IMAGE = BASE_DIR / "MST.png"
-FILTER_START_PERCENT = 0.20
-FILTER_END_PERCENT = 0.30
-FILTER_STEP_PERCENT = 0.05
-
-TOP_HUBS_TO_HIGHLIGHT = 5
-EDGE_LABEL_OFFSET = 0.035
+DEFAULT_MST_FILE = BASE_DIR / "MST.csv"
 TOP_HUBS_RED = 5
 TOP_HUBS_ORANGE = 5
-TOP_LABEL_EDGES = 10
+EDGE_LABEL_OFFSET = 0.035
 
 
-# ==============================
-# DRAW EDGE LABELS
-# ==============================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Visualize an existing MaxST and filtered product graphs."
+    )
+    parser.add_argument(
+        "--product-graph",
+        type=Path,
+        default=DEFAULT_PRODUCT_GRAPH_FILE,
+        help="Projected graph CSV (used for metadata validation).",
+    )
+    parser.add_argument(
+        "--mst",
+        type=Path,
+        help="MaxST CSV (default: MST.csv beside the product graph).",
+    )
+    parser.add_argument(
+        "--filtered-dir",
+        type=Path,
+        help="Directory containing Filtered_Graph_PERCENT.csv files.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Figure/output directory (default: product-graph directory).",
+    )
+    parser.add_argument(
+        "--percentages",
+        type=float,
+        nargs="+",
+        default=[100.0],
+        help="Filtered graph percentages to visualize (default: 100).",
+    )
+    parser.add_argument(
+        "--top-edge-labels",
+        type=int,
+        default=5,
+        help="Strongest filtered edges to label (default: 5).",
+    )
+    parser.add_argument("--dpi", type=int, default=600, help="Image DPI (default: 600).")
+    return parser.parse_args()
 
-def draw_edge_weight_labels_above(ax, graph, pos, offset=EDGE_LABEL_OFFSET):
-    for u, v, data in graph.edges(data=True):
-        x1, y1 = pos[u]
-        x2, y2 = pos[v]
 
-        mx = (x1 + x2) / 2
-        my = (y1 + y2) / 2
+def validate_args(args: argparse.Namespace) -> None:
+    if args.top_edge_labels < 0:
+        raise ValueError("--top-edge-labels must be greater than or equal to 0.")
+    if args.dpi < 72:
+        raise ValueError("--dpi must be at least 72.")
 
-        dx = x2 - x1
-        dy = y2 - y1
-        length = math.hypot(dx, dy)
 
-        if length == 0:
-            ox, oy = 0, offset
-        else:
-            ox = -dy / length * offset
-            oy = dx / length * offset
+def _write_dataframe_safely(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    frame.to_csv(temporary, sep=";", index=False)
+    temporary.replace(path)
 
-        ax.text(
-            mx + ox,
-            my + oy,
+
+def draw_edge_weight_labels_above(
+    axis,
+    graph: nx.Graph,
+    positions: dict,
+    offset: float = EDGE_LABEL_OFFSET,
+) -> None:
+    for product_1, product_2, data in graph.edges(data=True):
+        x1, y1 = positions[product_1]
+        x2, y2 = positions[product_2]
+        midpoint_x = (x1 + x2) / 2
+        midpoint_y = (y1 + y2) / 2
+        delta_x = x2 - x1
+        delta_y = y2 - y1
+        length = math.hypot(delta_x, delta_y)
+        offset_x, offset_y = (0, offset) if length == 0 else (
+            -delta_y / length * offset,
+            delta_x / length * offset,
+        )
+        axis.text(
+            midpoint_x + offset_x,
+            midpoint_y + offset_y,
             f"{data['weight']:.2f}",
             fontsize=7,
             color="black",
             ha="center",
             va="center",
-            bbox=dict(facecolor="white", edgecolor="none", alpha=0.75, pad=0.2),
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.2},
             zorder=5,
         )
 
 
-# ==============================
-# FILTER SETTINGS HELPERS
-# ==============================
-
-def build_filter_percentages(
-    start_percent: float = FILTER_START_PERCENT,
-    end_percent: float = FILTER_END_PERCENT,
-    step_percent: float = FILTER_STEP_PERCENT,
-) -> list[float]:
-    percentages = []
-    current = start_percent
-
-    while current <= end_percent + 1e-9:
-        percentages.append(round(current, 4))
-        current += step_percent
-
-    return percentages
+def ranked_degrees(graph: nx.Graph) -> list[tuple[str, int]]:
+    return sorted(graph.degree(), key=lambda item: (-item[1], item[0]))
 
 
-def format_percent_label(top_percent: float) -> str:
-    percent_value = top_percent * 100
+def visualize_mst_bfs(
+    graph: nx.Graph,
+    output_image: str | Path,
+    dpi: int = 600,
+) -> None:
+    if not nx.is_tree(graph):
+        raise ValueError("MST visualization input must be a connected tree.")
 
-    if float(percent_value).is_integer():
-        return str(int(percent_value))
+    degree = dict(graph.degree())
+    degree_ranking = ranked_degrees(graph)
+    root = degree_ranking[0][0]
+    top_hubs = {node for node, _ in degree_ranking[:TOP_HUBS_RED]}
+    positions = nx.bfs_layout(graph, start=root)
 
-    return f"{percent_value:.1f}".replace(".", "_")
-
-
-# ==============================
-# MST VISUALIZATION
-# ==============================
-
-def visualize_mst_bfs(graph: nx.Graph, output_image: str | Path = MST_OUTPUT_IMAGE):
-    degree_dict = dict(graph.degree())
-    sorted_degree = sorted(
-        degree_dict.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    root = sorted_degree[0][0]
-    top_hubs = [node for node, _ in sorted_degree[:TOP_HUBS_TO_HIGHLIGHT]]
-
-    pos = nx.bfs_layout(graph, start=root)
-    fig, ax = plt.subplots(figsize=(14, 10))
-
-    node_sizes = [400 + degree_dict[node] * 250 for node in graph.nodes()]
-    node_colors = [
-        "red" if node in top_hubs else "skyblue"
-        for node in graph.nodes()
-    ]
+    figure, axis = plt.subplots(figsize=(14, 10))
+    node_sizes = [400 + degree[node] * 250 for node in graph.nodes()]
+    node_colors = ["red" if node in top_hubs else "skyblue" for node in graph.nodes()]
     labels = {node: get_short_name(node) for node in graph.nodes()}
-
-    weights = [graph[u][v]["weight"] for u, v in graph.edges()]
+    weights = [data["weight"] for _, _, data in graph.edges(data=True)]
     max_weight = max(weights)
     edge_widths = [0.6 + (weight / max_weight) * 1.4 for weight in weights]
 
     nx.draw_networkx_nodes(
-        graph,
-        pos,
-        node_size=node_sizes,
-        node_color=node_colors,
-        alpha=0.9,
-        ax=ax,
+        graph, positions, node_size=node_sizes, node_color=node_colors, alpha=0.9, ax=axis
     )
-    nx.draw_networkx_edges(
-        graph,
-        pos,
-        width=edge_widths,
-        alpha=0.7,
-        ax=ax,
+    nx.draw_networkx_edges(graph, positions, width=edge_widths, alpha=0.7, ax=axis)
+    nx.draw_networkx_labels(graph, positions, labels=labels, font_size=8, ax=axis)
+    draw_edge_weight_labels_above(axis, graph, positions)
+    axis.set_title("Maximum Spanning Tree of Product Associations")
+    axis.axis("off")
+    figure.tight_layout()
+    figure.savefig(output_image, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def export_mst_centrality(mst: nx.Graph, output_file: str | Path) -> pd.DataFrame:
+    degree = dict(mst.degree())
+    degree_centrality = nx.degree_centrality(mst)
+    # Weights represent strength rather than distance, so manuscript
+    # betweenness is calculated on the unweighted MaxST topology.
+    betweenness = nx.betweenness_centrality(mst, normalized=True, weight=None)
+    rows = [
+        {
+            "Product": node,
+            "ShortName": get_short_name(node),
+            "Degree": degree[node],
+            "DegreeCentrality": degree_centrality[node],
+            "BetweennessCentrality": betweenness[node],
+        }
+        for node in mst.nodes()
+    ]
+    frame = pd.DataFrame(rows).sort_values(
+        ["Degree", "BetweennessCentrality", "Product"],
+        ascending=[False, False, True],
+        kind="stable",
     )
-    nx.draw_networkx_labels(
-        graph,
-        pos,
-        labels=labels,
-        font_size=8,
-        ax=ax,
-    )
+    _write_dataframe_safely(frame, Path(output_file))
+    return frame
 
-    draw_edge_weight_labels_above(ax, graph, pos)
-
-    ax.set_title("Maximum Spanning Tree of Product Associations\n(Hierarchical BFS Layout)")
-    ax.axis("off")
-    fig.tight_layout()
-    plt.savefig(output_image, dpi=300, bbox_inches="tight")
-    plt.show()
-
-
-# ==============================
-# FILTERED GRAPH VISUALIZATION
-# ==============================
 
 def draw_filtered_graph(
-    filtered_graph: nx.Graph,
+    graph: nx.Graph,
     top_percent: float,
     output_png: str | Path,
+    top_edge_labels: int = 5,
+    dpi: int = 600,
 ) -> None:
-    graph_to_draw = filtered_graph.copy()
-    graph_to_draw.remove_nodes_from(get_isolated_nodes(filtered_graph))
+    if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
+        raise ValueError("Filtered graph must contain nodes and edges.")
 
-    if graph_to_draw.number_of_nodes() == 0:
-        return
-
-    degree_dict = dict(graph_to_draw.degree())
-    sorted_degree = sorted(
-        degree_dict.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    top_red = [node for node, _ in sorted_degree[:TOP_HUBS_RED]]
-    top_orange = [
+    degree = dict(graph.degree())
+    degree_ranking = ranked_degrees(graph)
+    top_red = {node for node, _ in degree_ranking[:TOP_HUBS_RED]}
+    top_orange = {
         node
-        for node, _ in sorted_degree[TOP_HUBS_RED:TOP_HUBS_RED + TOP_HUBS_ORANGE]
-    ]
-
-    pos = nx.spring_layout(
-        graph_to_draw,
+        for node, _ in degree_ranking[TOP_HUBS_RED : TOP_HUBS_RED + TOP_HUBS_ORANGE]
+    }
+    positions = nx.spring_layout(
+        graph,
         weight="weight",
         k=2.5,
         iterations=300,
         seed=42,
     )
 
-    plt.figure(figsize=(20, 15))
-
-    weights = [graph_to_draw[u][v]["weight"] for u, v in graph_to_draw.edges()]
-    max_weight = max(weights) if weights else 1.0
+    figure, axis = plt.subplots(figsize=(20, 15))
+    weights = [data["weight"] for _, _, data in graph.edges(data=True)]
+    max_weight = max(weights)
     edge_widths = [0.5 + (weight / max_weight) * 2 for weight in weights]
-
-    max_degree = max(degree_dict.values()) if degree_dict else 1
-    node_sizes = [
-        600 + (degree_dict[node] / max_degree) * 1500
-        for node in graph_to_draw.nodes()
+    max_degree = max(degree.values())
+    node_sizes = [600 + (degree[node] / max_degree) * 1500 for node in graph.nodes()]
+    node_colors = [
+        "red" if node in top_red else "orange" if node in top_orange else "skyblue"
+        for node in graph.nodes()
     ]
+    labels = {node: get_short_name(node) for node in graph.nodes()}
 
-    node_colors = []
-    for node in graph_to_draw.nodes():
-        if node in top_red:
-            node_colors.append("red")
-        elif node in top_orange:
-            node_colors.append("orange")
-        else:
-            node_colors.append("skyblue")
-
-    labels = {node: get_short_name(node) for node in graph_to_draw.nodes()}
-
-    nx.draw_networkx_edges(graph_to_draw, pos, width=edge_widths, alpha=0.5)
+    nx.draw_networkx_edges(graph, positions, width=edge_widths, alpha=0.5, ax=axis)
     nx.draw_networkx_nodes(
-        graph_to_draw,
-        pos,
+        graph,
+        positions,
         node_size=node_sizes,
         node_color=node_colors,
         alpha=0.9,
+        ax=axis,
     )
     nx.draw_networkx_labels(
-        graph_to_draw,
-        pos,
+        graph,
+        positions,
         labels=labels,
         font_size=10,
         font_weight="bold",
+        ax=axis,
     )
 
-    edges_sorted = sorted(
-        graph_to_draw.edges(data=True),
-        key=lambda edge: edge[2]["weight"],
-        reverse=True,
-    )
-    top_edges = edges_sorted[:TOP_LABEL_EDGES]
-    edge_labels = {(u, v): f"{data['weight']:.2f}" for u, v, data in top_edges}
+    strongest = sorted(
+        graph.edges(data=True),
+        key=lambda edge: (-edge[2]["weight"], edge[2].get("edge_order", 0)),
+    )[:top_edge_labels]
+    edge_labels = {
+        (product_1, product_2): f"{data['weight']:.2f}"
+        for product_1, product_2, data in strongest
+    }
+    if edge_labels:
+        nx.draw_networkx_edge_labels(
+            graph,
+            positions,
+            edge_labels=edge_labels,
+            font_size=8,
+            font_color="black",
+            label_pos=0.5,
+            ax=axis,
+        )
 
-    nx.draw_networkx_edge_labels(
-        graph_to_draw,
-        pos,
-        edge_labels=edge_labels,
-        font_size=8,
-        font_color="black",
-        label_pos=0.5,
-    )
-
-    plt.title(
+    axis.set_title(
         f"Filtered Product Network (Top {format_percent_label(top_percent)}% Edges)\n"
-        f"Edge labels shown for top {TOP_LABEL_EDGES} strongest connections"
+        f"Edge labels shown for the {top_edge_labels} strongest connections"
+    )
+    axis.axis("off")
+    figure.tight_layout()
+    figure.savefig(output_png, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def run_analysis(args: argparse.Namespace) -> None:
+    validate_args(args)
+    product_graph_file = args.product_graph.expanduser().resolve()
+    mst_file = (
+        args.mst.expanduser().resolve()
+        if args.mst
+        else product_graph_file.with_name("MST.csv")
+    )
+    filtered_dir = (
+        args.filtered_dir.expanduser().resolve()
+        if args.filtered_dir
+        else product_graph_file.parent
+    )
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir
+        else product_graph_file.parent
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    percentages = normalize_percentages(args.percentages)
+    total_start = perf_counter()
+    timing_rows = []
+
+    step_start = perf_counter()
+    product_graph = load_projected_graph(product_graph_file)
+    mst = load_projected_graph(mst_file)
+    if set(mst.nodes()) != set(product_graph.nodes()):
+        raise ValueError("MaxST and product graph do not contain the same nodes.")
+    timing_rows.append({"Step": "Load graph and MaxST", "Seconds": perf_counter() - step_start})
+
+    step_start = perf_counter()
+    visualize_mst_bfs(mst, output_dir / "MST.png", dpi=args.dpi)
+    centrality = export_mst_centrality(mst, output_dir / "MST_CENTRALITY.csv")
+    timing_rows.append(
+        {"Step": "MST figure and centrality", "Seconds": perf_counter() - step_start}
     )
 
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(output_png, dpi=300, bbox_inches="tight")
-    plt.show()
+    for percentage in percentages:
+        label = format_percent_label(percentage)
+        filtered_file = filtered_dir / f"Filtered_Graph_{label}.csv"
+        step_start = perf_counter()
+        filtered_graph = load_projected_graph(filtered_file)
+        draw_filtered_graph(
+            filtered_graph,
+            percentage,
+            output_dir / f"Filtered_Graph_{label}.png",
+            top_edge_labels=args.top_edge_labels,
+            dpi=args.dpi,
+        )
+        timing_rows.append(
+            {"Step": f"Draw filtered graph top {label}%", "Seconds": perf_counter() - step_start}
+        )
+
+    timing_rows.append({"Step": "Total pipeline", "Seconds": perf_counter() - total_start})
+    timing = pd.DataFrame(timing_rows)
+    timing["Seconds"] = timing["Seconds"].round(4)
+    _write_dataframe_safely(timing, output_dir / "NETWORK_VISUALIZATION_TIMING_SUMMARY.csv")
+
+    metadata = pd.DataFrame(
+        {
+            "Metric": [
+                "Product graph",
+                "MaxST",
+                "Visualized percentages",
+                "Labeled filtered edges",
+                "Product graph nodes",
+                "Product graph edges",
+                "MaxST nodes",
+                "MaxST edges",
+                "Top degree hub",
+            ],
+            "Value": [
+                str(product_graph_file),
+                str(mst_file),
+                ", ".join(format_percent_label(value) for value in percentages),
+                str(args.top_edge_labels),
+                str(product_graph.number_of_nodes()),
+                str(product_graph.number_of_edges()),
+                str(mst.number_of_nodes()),
+                str(mst.number_of_edges()),
+                str(centrality.iloc[0]["Product"]),
+            ],
+        }
+    )
+    _write_dataframe_safely(metadata, output_dir / "NETWORK_VISUALIZATION_RUN_METADATA.csv")
+
+    print("Network visualization completed.")
+    print(f"MST image: {output_dir / 'MST.png'}")
+    print(f"MST centrality: {output_dir / 'MST_CENTRALITY.csv'}")
+    print(f"Top degree hub: {centrality.iloc[0]['Product']}")
+    for row in timing.itertuples(index=False):
+        print(f"{row.Step}: {row.Seconds:.4f} s")
 
 
-# ==============================
-# ENTRY POINT
-# ==============================
-
-def main():
-    full_graph = build_full_graph_from_rules(INPUT_FILE)
-
-    mst = build_mst_from_graph(full_graph)
-    export_mst(mst, MST_OUTPUT_CSV)
-    visualize_mst_bfs(mst, MST_OUTPUT_IMAGE)
-
-    for top_percent in build_filter_percentages():
-        percent_label = format_percent_label(top_percent)
-        filtered_output_csv = BASE_DIR / f"Filtered_Graph_{percent_label}.csv"
-        filtered_output_image = BASE_DIR / f"Filtered_Graph_{percent_label}.png"
-
-        filtered_graph = build_filtered_graph_from_graph(full_graph, top_percent)
-        export_filtered_graph(filtered_graph, filtered_output_csv)
-        draw_filtered_graph(filtered_graph, top_percent, filtered_output_image)
+def main() -> None:
+    run_analysis(parse_args())
 
 
 if __name__ == "__main__":
