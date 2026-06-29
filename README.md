@@ -1,4 +1,4 @@
-# ARHyMST: From Redundant Association Rules to Product Networks
+# From Redundant Association Rules to Product Networks
 
 Reproducible code for the study **From Redundant Association Rules to Product Networks: A Scalable Approach Using Hypergraph-Inspired Rule Reduction and Maximum Spanning Trees**.
 
