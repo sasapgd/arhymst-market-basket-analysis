@@ -239,6 +239,17 @@ python generate_supplementary_tables.py --base-dir . --output-dir generated_supp
 
 This generates workbook summaries from the corresponding result CSV files. Additional comparison summaries are written by `mst_comparison_analysis.py` and `mst_weight_sensitivity.py`.
 
+## High-resolution figures
+
+High-resolution versions of Figures 2 and 3 from the manuscript are available in the `figures` folder:
+
+* [`Figure2_Maximum_Spanning_Tree_high_resolution.png`](figures/Figure2_Maximum_Spanning_Tree_high_resolution.png)
+* [`Figure3_Filtered_Product_Network_high_resolution.png`](figures/Figure3_Filtered_Product_Network_high_resolution.png)
+
+The figures were generated programmatically using the analysis code provided in this repository. The versions submitted through the journal system were resized to meet the platform’s technical upload requirements, which may reduce the readability of some node labels. The files provided here preserve the original output dimensions and resolution.
+
+Full product-category names corresponding to the abbreviated node labels are provided in Supplementary Table S5.
+///99
 ## Citation
 
 If you use the dataset, cite the Zenodo record:
